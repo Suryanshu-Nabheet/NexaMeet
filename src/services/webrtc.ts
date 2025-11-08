@@ -195,15 +195,15 @@ export class WebRTCService {
         reconnectionAttempts: this.maxReconnectAttempts,
         reconnectionDelay: 1000,
         timeout: 20000,
-        autoConnect: false,
+        autoConnect: true,
         path: '/socket.io',
-        forceNew: false,
+        forceNew: true,
         withCredentials: true,
         query: {
           meetingId: this.meetingId,
           participantId: this.participantId,
           participantName: this.localParticipantState.name || 'Anonymous',
-          isHost: this.localParticipantState.isHost || false
+          isHost: String(this.localParticipantState.isHost || false)
         }
       });
 
@@ -247,7 +247,11 @@ export class WebRTCService {
           console.log('WebRTCService: Added new remote participant to map:', newParticipant);
           this.onParticipantsUpdate(this.participants);
 
-          const isInitiator = this.localParticipantState.isHost || (this.participantId > participantId && !Array.from(this.participants.values()).some(p => p.isHost));
+          // Determine who should initiate the connection
+          // Host always initiates, otherwise the participant with the lexicographically smaller ID
+          const isInitiator = this.localParticipantState.isHost || 
+            (!state.isHost && this.participantId < participantId);
+          
           if (isInitiator) {
             console.log(`WebRTCService: Initiating peer connection and creating offer for ${participantId}.`);
             await this.createPeerConnection(participantId, true);
@@ -307,8 +311,7 @@ export class WebRTCService {
         console.error('WebRTCService: Socket error event:', error);
       });
 
-      console.log('WebRTCService: Calling socket.connect()');
-      this.socket.connect();
+      console.log('WebRTCService: Socket configured and connecting...');
 
     } catch (error) {
       console.error('WebRTCService: Error during socket connection setup:', error);
@@ -317,7 +320,7 @@ export class WebRTCService {
     }
   }
 
-  private async createPeerConnection(participantId: string, createOffer: boolean) {
+  private async createPeerConnection(participantId: string, createOffer: boolean): Promise<RTCPeerConnection> {
     console.log('WebRTCService: createPeerConnection called for participant:', participantId, 'createOffer:', createOffer);
     try {
       const configuration: RTCConfiguration = {
@@ -447,17 +450,26 @@ export class WebRTCService {
         });
       }
 
+      return peerConnection;
     } catch (error) {
       console.error('WebRTCService: Error creating peer connection:', error);
       this.handleError(new Error('Failed to create peer connection'));
+      throw error;
     }
   }
 
   private async handleOffer(from: string, offer: RTCSessionDescriptionInit) {
     console.log('WebRTCService: handleOffer called from:', from);
     try {
-      const peerConnection = this.peerConnections.get(from) || await this.createPeerConnection(from, false);
-      if (peerConnection instanceof RTCPeerConnection && this.socket) {
+      let peerConnection = this.peerConnections.get(from);
+      
+      // Create peer connection if it doesn't exist (answerer side)
+      if (!peerConnection) {
+        console.log('WebRTCService: Creating peer connection for incoming offer from', from);
+        peerConnection = await this.createPeerConnection(from, false);
+      }
+      
+      if (peerConnection && this.socket) {
         console.log('WebRTCService: Setting remote description (offer) for', from);
         await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
         console.log('WebRTCService: Creating answer for', from);
@@ -472,7 +484,7 @@ export class WebRTCService {
       }
     } catch (error) {
       console.error('WebRTCService: Error handling offer:', error);
-      this.handleError(new Error('Failed to handle offer'));
+      this.handleError(error instanceof Error ? error : new Error('Failed to handle offer'));
     }
   }
 

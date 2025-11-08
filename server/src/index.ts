@@ -1,8 +1,29 @@
 import express from 'express';
 import { createServer } from 'http';
-import { Server } from 'socket.io';
+import { Server, Socket } from 'socket.io';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
+import { MonitoringService } from './monitoring';
+import { SecurityService } from './security';
+
+// WebRTC types
+interface RTCSessionDescriptionInit {
+  type: 'offer' | 'answer' | 'pranswer' | 'rollback';
+  sdp?: string;
+}
+
+interface RTCIceCandidateInit {
+  candidate?: string;
+  sdpMLineIndex?: number | null;
+  sdpMid?: string | null;
+}
+
+interface ParticipantSocketData {
+  meetingId: string;
+  participantId: string;
+  participantName: string;
+  isHost: boolean;
+}
 
 const app = express();
 const httpServer = createServer(app);
@@ -55,33 +76,54 @@ const io = new Server(httpServer, {
   }
 });
 
-// Add connection logging middleware
-io.use((socket, next) => {
-  const { meetingId, participantId } = socket.handshake.query;
+// Add connection logging middleware with security
+io.use(securityService.socketRateLimitMiddleware());
+io.use((socket: Socket, next: (err?: Error) => void) => {
+  const { meetingId, participantId, participantName, isHost } = socket.handshake.query;
   
+  // Validate inputs
   if (!meetingId || !participantId) {
     console.error('Invalid connection attempt:', socket.handshake.query);
+    monitoringService.recordError(new Error('Missing required parameters'), 'socket-connection');
     return next(new Error('Missing required parameters'));
+  }
+
+  // Validate format
+  if (!securityService.validateMeetingId(meetingId as string)) {
+    monitoringService.recordError(new Error('Invalid meeting ID format'), 'socket-connection');
+    return next(new Error('Invalid meeting ID format'));
+  }
+
+  if (!securityService.validateParticipantId(participantId as string)) {
+    monitoringService.recordError(new Error('Invalid participant ID format'), 'socket-connection');
+    return next(new Error('Invalid participant ID format'));
   }
 
   console.log('New socket connection attempt:', {
     id: socket.id,
     meetingId,
     participantId,
+    participantName,
+    isHost,
     address: socket.handshake.address
   });
 
-  // Check if participant is already connected
-  const room = rooms.get(meetingId as string);
-  if (room && room.has(participantId as string)) {
-    console.log('Participant already connected, updating socket ID');
-    // Update existing participant's socket ID
-    const participant = room.get(participantId as string);
-    if (participant) {
-      participant.socketId = socket.id;
-      room.set(participantId as string, participant);
-    }
+  // Store participant data in socket
+  let isHostValue = false;
+  if (Array.isArray(isHost)) {
+    isHostValue = isHost[0] === 'true';
+  } else if (typeof isHost === 'string') {
+    isHostValue = isHost === 'true';
+  } else if (typeof isHost === 'boolean') {
+    isHostValue = isHost;
   }
+  
+  socket.data = {
+    meetingId: meetingId as string,
+    participantId: participantId as string,
+    participantName: (participantName as string) || 'Participant',
+    isHost: isHostValue
+  };
 
   next();
 });
@@ -96,10 +138,22 @@ interface Participant {
 
 const rooms = new Map<string, Map<string, Participant>>();
 
+// Initialize services
+const monitoringService = new MonitoringService(io);
+const securityService = new SecurityService(
+  parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100', 10),
+  parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10)
+);
+
 // Configure Express middleware
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Apply security middleware
+if (process.env.RATE_LIMIT_ENABLED !== 'false') {
+  app.use(securityService.rateLimitMiddleware());
+}
 
 // Error handling middleware
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -113,20 +167,26 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
 
 // Health check endpoint with detailed response
 app.get('/health', (req, res) => {
+  const healthStatus = monitoringService.getHealthStatus();
   const serverInfo = {
-    status: 'ok',
+    status: healthStatus.status,
     timestamp: new Date().toISOString(),
     port: PORT,
-    rooms: rooms.size,
-    totalParticipants: Array.from(rooms.values()).reduce((acc, room) => acc + room.size, 0),
     uptime: process.uptime(),
+    metrics: healthStatus.metrics,
+    issues: healthStatus.issues,
     cors: {
       origin: corsOptions.origin,
       methods: corsOptions.methods
     }
   };
-  console.log('Health check:', serverInfo);
-  res.json(serverInfo);
+  const statusCode = healthStatus.status === 'unhealthy' ? 503 : 200;
+  res.status(statusCode).json(serverInfo);
+});
+
+// Metrics endpoint
+app.get('/metrics', (req, res) => {
+  res.json(monitoringService.getMetrics());
 });
 
 // Create a new meeting with validation
@@ -249,47 +309,248 @@ app.get('/api/meetings/:meetingId', (req, res) => {
 });
 
 // Socket.IO connection handling
-io.on('connection', (socket) => {
+io.on('connection', (socket: Socket) => {
   console.log('New client connected:', socket.id);
 
-  socket.on('join-meeting', async (data) => {
-    try {
-      const { meetingId, participantId, participantName, state } = data;
-      console.log(`Participant ${participantName} (${participantId}) joining meeting ${meetingId}`);
-      
-      // Join the meeting room
-      socket.join(meetingId);
-      
-      // Store participant info
-      socket.data = {
-        meetingId,
-        participantId,
-        participantName,
-        state
-      };
+  // Handle connection - participant data is already stored in middleware
+  const socketData = socket.data as ParticipantSocketData | undefined;
+  const { meetingId, participantId, participantName, isHost } = socketData || {};
+  
+  if (!meetingId || !participantId) {
+    console.error('Missing participant data on connection');
+    socket.disconnect();
+    return;
+  }
 
-      // Notify others in the meeting
-      socket.to(meetingId).emit('participant-joined', {
-        participantId,
-        participantName,
-        state
+  console.log(`Participant ${participantName} (${participantId}) connecting to meeting ${meetingId}`);
+  
+  // Join the meeting room
+  socket.join(meetingId);
+
+  // Get existing participants in the room
+  const roomParticipants = Array.from(io.sockets.adapter.rooms.get(meetingId) || [])
+    .map(socketId => {
+      const s = io.sockets.sockets.get(socketId) as Socket | undefined;
+      return s?.data as ParticipantSocketData | undefined;
+    })
+    .filter((data): data is ParticipantSocketData => Boolean(data));
+
+  // Notify others in the meeting about new participant
+  socket.to(meetingId).emit('participant-joined', {
+    participantId,
+    participantName,
+    state: {
+      isHost: isHost || false,
+      isAudioEnabled: true,
+      isVideoEnabled: true,
+      isScreenSharing: false,
+      isHandRaised: false,
+      isAdmitted: true
+    }
+  });
+
+  // Send list of existing participants to the new participant
+  roomParticipants.forEach(existingParticipant => {
+    if (existingParticipant && existingParticipant.participantId !== participantId) {
+      socket.emit('participant-joined', {
+        participantId: existingParticipant.participantId,
+        participantName: existingParticipant.participantName,
+        state: {
+          isHost: existingParticipant.isHost || false,
+          isAudioEnabled: true,
+          isVideoEnabled: true,
+          isScreenSharing: false,
+          isHandRaised: false,
+          isAdmitted: true
+        }
       });
+    }
+  });
 
-      // Send acknowledgment
-      socket.emit('join-meeting-success', {
-        meetingId,
+  // WebRTC Signaling: Handle offer
+  socket.on('offer', (data: { to: string; offer: RTCSessionDescriptionInit }) => {
+    try {
+      const { to, offer } = data;
+      const socketData = socket.data as ParticipantSocketData | undefined;
+      const { participantId: from } = socketData || {};
+      
+      if (!from || !to) {
+        console.error('Missing participant IDs in offer');
+        return;
+      }
+
+      console.log(`Offer from ${from} to ${to}`);
+      
+      // Find the target socket
+      const targetSocket = Array.from(io.sockets.sockets.values())
+        .find((s: Socket) => {
+          const data = s.data as ParticipantSocketData | undefined;
+          return data?.participantId === to && data?.meetingId === socketData?.meetingId;
+        }) as Socket | undefined;
+      
+      if (targetSocket) {
+        targetSocket.emit('offer', { from, offer });
+      } else {
+        console.error(`Target participant ${to} not found`);
+        socket.emit('error', { message: `Participant ${to} not found` });
+      }
+    } catch (error) {
+      console.error('Error handling offer:', error);
+      socket.emit('error', { message: 'Failed to handle offer' });
+    }
+  });
+
+  // WebRTC Signaling: Handle answer
+  socket.on('answer', (data: { to: string; answer: RTCSessionDescriptionInit }) => {
+    try {
+      const { to, answer } = data;
+      const socketData = socket.data as ParticipantSocketData | undefined;
+      const { participantId: from } = socketData || {};
+      
+      if (!from || !to) {
+        console.error('Missing participant IDs in answer');
+        return;
+      }
+
+      console.log(`Answer from ${from} to ${to}`);
+      
+      // Find the target socket
+      const targetSocket = Array.from(io.sockets.sockets.values())
+        .find((s: Socket) => {
+          const data = s.data as ParticipantSocketData | undefined;
+          return data?.participantId === to && data?.meetingId === socketData?.meetingId;
+        }) as Socket | undefined;
+      
+      if (targetSocket) {
+        targetSocket.emit('answer', { from, answer });
+      } else {
+        console.error(`Target participant ${to} not found`);
+        socket.emit('error', { message: `Participant ${to} not found` });
+      }
+    } catch (error) {
+      console.error('Error handling answer:', error);
+      socket.emit('error', { message: 'Failed to handle answer' });
+    }
+  });
+
+  // WebRTC Signaling: Handle ICE candidate
+  socket.on('ice-candidate', (data: { to: string; candidate: RTCIceCandidateInit }) => {
+    try {
+      const { to, candidate } = data;
+      const socketData = socket.data as ParticipantSocketData | undefined;
+      const { participantId: from } = socketData || {};
+      
+      if (!from || !to) {
+        console.error('Missing participant IDs in ice-candidate');
+        return;
+      }
+
+      console.log(`ICE candidate from ${from} to ${to}`);
+      
+      // Find the target socket
+      const targetSocket = Array.from(io.sockets.sockets.values())
+        .find((s: Socket) => {
+          const data = s.data as ParticipantSocketData | undefined;
+          return data?.participantId === to && data?.meetingId === socketData?.meetingId;
+        }) as Socket | undefined;
+      
+      if (targetSocket) {
+        targetSocket.emit('ice-candidate', { from, candidate });
+      } else {
+        console.error(`Target participant ${to} not found`);
+      }
+    } catch (error) {
+      console.error('Error handling ICE candidate:', error);
+    }
+  });
+
+  // Handle participant updates
+  socket.on('participant-update', (data: { participantId: string; updates: Record<string, unknown> }) => {
+    try {
+      const { participantId, updates } = data;
+      const socketData = socket.data as ParticipantSocketData | undefined;
+      const { meetingId } = socketData || {};
+      
+      if (!meetingId) {
+        console.error('Missing meeting ID in participant-update');
+        return;
+      }
+
+      console.log(`Participant update from ${participantId} in meeting ${meetingId}`);
+      
+      // Broadcast to all participants in the meeting except the sender
+      socket.to(meetingId).emit('participant-updated', {
         participantId,
-        participantName
+        updates
       });
     } catch (error) {
-      console.error('Error in join-meeting:', error);
-      socket.emit('error', { message: 'Failed to join meeting' });
+      console.error('Error handling participant-update:', error);
+    }
+  });
+
+  // Handle meeting state updates
+  socket.on('meeting-state-update', (data: { state: string; data: Record<string, unknown> }) => {
+    try {
+      const socketData = socket.data as ParticipantSocketData | undefined;
+      const { meetingId } = socketData || {};
+      
+      if (!meetingId) {
+        console.error('Missing meeting ID in meeting-state-update');
+        return;
+      }
+
+      console.log(`Meeting state update in meeting ${meetingId}`);
+      
+      // Broadcast to all participants in the meeting
+      io.to(meetingId).emit('meeting-state-updated', data);
+    } catch (error) {
+      console.error('Error handling meeting-state-update:', error);
+    }
+  });
+
+  // Handle remove participant (host only)
+  socket.on('remove-participant', (data: { participantId: string; meetingId: string }) => {
+    try {
+      const { participantId, meetingId: targetMeetingId } = data;
+      const socketData = socket.data as ParticipantSocketData | undefined;
+      const { participantId: requesterId, meetingId, isHost } = socketData || {};
+      
+      if (!isHost) {
+        socket.emit('error', { message: 'Only host can remove participants' });
+        return;
+      }
+
+      if (meetingId !== targetMeetingId) {
+        socket.emit('error', { message: 'Invalid meeting ID' });
+        return;
+      }
+
+      console.log(`Host ${requesterId} removing participant ${participantId} from meeting ${meetingId}`);
+      
+      // Find and disconnect the target participant
+      const targetSocket = Array.from(io.sockets.sockets.values())
+        .find((s: Socket) => {
+          const data = s.data as ParticipantSocketData | undefined;
+          return data?.participantId === participantId && data?.meetingId === meetingId;
+        }) as Socket | undefined;
+      
+      if (targetSocket) {
+        targetSocket.emit('removed-from-meeting', { reason: 'Removed by host' });
+        targetSocket.disconnect();
+      }
+      
+      // Notify others
+      socket.to(meetingId).emit('participant-left', { participantId });
+    } catch (error) {
+      console.error('Error handling remove-participant:', error);
+      socket.emit('error', { message: 'Failed to remove participant' });
     }
   });
 
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
-    const { meetingId, participantId } = socket.data || {};
+    const data = socket.data as ParticipantSocketData | undefined;
+    const { meetingId, participantId } = data || {};
     if (meetingId && participantId) {
       socket.to(meetingId).emit('participant-left', { participantId });
     }
